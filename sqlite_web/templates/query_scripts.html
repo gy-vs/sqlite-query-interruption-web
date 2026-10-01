@@ -11,5 +11,10 @@
       queryUrl: {{ url_for('generic_query')|tojson }},
       tableQueryUrl: {{ url_for('table_query', table='__TABLE__')|tojson }}
     });
+
+    var runner = new App.QueryRunner();
+    runner.initialize({
+      cancelUrl: {{ url_for('query_cancel', execution_id='')|tojson }}
+    });
   });
 </script>

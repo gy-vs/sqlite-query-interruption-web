@@ -7,6 +7,7 @@ import datetime
 import decimal
 import hashlib
 import importlib
+import json
 import logging
 import math
 import operator
@@ -18,6 +19,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import webbrowser
 from collections import namedtuple, OrderedDict
 from functools import reduce
@@ -78,12 +80,12 @@ from playhouse.migrate import migrate
 
 try:
     from sqlite_web.executor import (
-        Result, is_read, key_decode, key_encode, run_one, run_script,
-        split_statements, wrap)
+        Result, ExecutionStopped, is_read, is_interrupt_error, key_decode,
+        key_encode, run_one, run_script, split_statements, wrap)
 except ImportError:
     from executor import (
-        Result, is_read, key_decode, key_encode, run_one, run_script,
-        split_statements, wrap)
+        Result, ExecutionStopped, is_read, is_interrupt_error, key_decode,
+        key_encode, run_one, run_script, split_statements, wrap)
 
 
 CUR_DIR = os.path.realpath(os.path.dirname(__file__))
@@ -104,6 +106,64 @@ app.config.from_object(__name__)
 datasets = {}
 datasets_lock = threading.Lock()
 dataset_config = {}
+
+#
+# Long-running query execution.
+#
+
+class QueryExecution:
+    """One Execute submission, tracked while its worker thread is running.
+
+    The worker owns its own connection on the dataset, so interrupt() can be
+    called from the request thread that handles a stop. Entries are removed
+    as soon as the worker finishes; a stop that arrives afterwards cannot
+    affect a later submission.
+    """
+    def __init__(self, dataset_key, connection):
+        self.id = uuid.uuid4().hex
+        self.dataset_key = dataset_key
+        self.connection = connection
+        self.stop_event = threading.Event()
+        self.thread = None
+        self.outcome = None
+
+    def request_stop(self):
+        self.stop_event.set()
+        conn = self.connection
+        if conn is not None:
+            try:
+                # Safe to call from any thread; it ends the sqlite work, it
+                # does not merely hide a spinner.
+                conn.interrupt()
+            except Exception:
+                app.logger.exception('Error interrupting query execution.')
+
+
+class ExecutionRegistry:
+    def __init__(self):
+        self._executions = {}
+        self._lock = threading.Lock()
+
+    def add(self, execution):
+        with self._lock:
+            self._executions[execution.id] = execution
+
+    def get(self, execution_id):
+        with self._lock:
+            return self._executions.get(execution_id)
+
+    def remove(self, execution_id):
+        with self._lock:
+            self._executions.pop(execution_id, None)
+
+    def clear_all(self):
+        with self._lock:
+            executions = list(self._executions.values())
+            self._executions.clear()
+        return executions
+
+
+query_executions = ExecutionRegistry()
 
 #
 # Database metadata objects.
@@ -498,6 +558,249 @@ def unload():
 
     return render_template('unload.html', selected=dataset)
 
+def _query_table_context(table):
+    dataset = get_dataset()
+    if table:
+        default_sql = 'SELECT * FROM %s' % quote_ident(table)
+        model_class = dataset[table].model_class
+        pk = model_class._meta.primary_key
+        is_composite_pk = isinstance(pk, CompositeKey)
+        allow_detail = dataset.cached_has_usable_pk(table)
+        allow_edit = allow_detail and not dataset.is_readonly
+        allow_bulk = allow_edit and not is_composite_pk
+        fk_lookup = dataset.cached_fk_lookup(table)
+    else:
+        default_sql = ''
+        model_class = dataset._base_model
+        pk = None
+        is_composite_pk = False
+        allow_detail = allow_edit = allow_bulk = False
+        fk_lookup = {}
+    return {
+        'dataset': dataset,
+        'default_sql': default_sql,
+        'model_class': model_class,
+        'pk': pk,
+        'is_composite_pk': is_composite_pk,
+        'allow_detail': allow_detail,
+        'allow_edit': allow_edit,
+        'allow_bulk': allow_bulk,
+        'fk_lookup': fk_lookup,
+    }
+
+
+def _execute_submission(dataset, sql, statements, page, ordering, explain,
+                        table_ctx, want_count=False, stop_event=None,
+                        single_read=None):
+    """The shared execution semantics for one Execute submission: one
+    statement is wrapped for paging, a script runs statement-by-statement
+    and stops at the first error or at a user-requested stop. Already
+    completed statements are left exactly as they ran."""
+    rpp = app.config['QUERY_ROWS_PER_PAGE']
+    result = results = None
+    total = total_pages = None
+
+    def stopped_single(result):
+        return dict(result=result, results=None, total=None,
+                    total_pages=None, single_read=False, stopped=True)
+
+    if single_read is None:
+        try:
+            single_read = len(statements) == 1 and is_read(
+                dataset, sql, stop_event=stop_event)
+        except ExecutionStopped:
+            return stopped_single(Result('stopped', sql))
+
+    if len(statements) == 1:
+        # EXPLAIN QUERY PLAN compiles the statement without running it.
+        run_sql = 'EXPLAIN QUERY PLAN %s' % sql if explain else sql
+        result = run_one(dataset, run_sql, page=page, page_size=rpp,
+                         ordering=ordering, stop_event=stop_event)
+        stopped = result.kind == 'stopped'
+    else:
+        results = run_script(dataset, statements, page_size=rpp,
+                             stop_event=stop_event)
+        stopped = bool(results) and results[-1].kind == 'stopped'
+
+    pk = table_ctx['pk']
+    if (result is not None and result.kind == 'rows' and
+            table_ctx['allow_detail'] and not explain and
+            not table_ctx['is_composite_pk'] and
+            pk.column_name in result.columns):
+        pk_index = result.columns.index(pk.column_name)  # First one wins.
+        result.keys = [key_encode([row[pk_index]]) for row in result.rows]
+
+    if (result is not None and result.kind == 'rows' and want_count):
+        try:
+            total, = dataset.query(wrap(sql, select='COUNT(*)')).fetchone()
+            total_pages = max(1, int(math.ceil(total / float(rpp))))
+        except Exception:
+            total = total_pages = None
+
+    return dict(result=result, results=results, total=total,
+                total_pages=total_pages, single_read=single_read,
+                stopped=stopped)
+
+
+def _query_render_vars(table, sql, statements, page, ordering, explain,
+                       outcome, table_ctx):
+    """Variables for the results area, identical whether rendered with the
+    full page (GET, pagination, native POST) or swapped in after an
+    asynchronous Execute."""
+    result = outcome['result']
+    results = outcome['results']
+    single_read = outcome['single_read']
+    rpp = app.config['QUERY_ROWS_PER_PAGE']
+
+    allow_bulk = table_ctx['allow_bulk'] and single_read
+    error = result.error if result is not None and \
+        result.kind == 'error' else None
+    show_bulk_form = bool(
+        table is not None and allow_bulk and result is not None and
+        result.kind == 'rows' and result.keys)
+    return {
+        'error': error,
+        'fk_lookup': table_ctx['fk_lookup'],
+        'ordering': ordering,
+        'page': page,
+        'page_start': (page - 1) * rpp + 1,
+        'paginate': single_read and not explain,
+        'result': result,
+        'results': results,
+        'show_bulk_form': show_bulk_form,
+        'show_detail': table_ctx['allow_detail'] and bool(
+            result is not None and result.keys),
+        'show_edit': table_ctx['allow_edit'] and bool(
+            result is not None and result.keys),
+        'sql': sql,
+        'stopped': outcome['stopped'],
+        'table': table,
+        'total': outcome['total'],
+        'total_pages': outcome['total_pages'],
+        'total_statements': len(statements),
+    }
+
+
+def _query_worker(execution, dataset_key, sql, statements, page, ordering,
+                  explain, want_count, table_ctx):
+    dataset = datasets[dataset_key]
+    database = dataset._database
+    try:
+        dataset.connect()
+        # Publish the worker-owned raw connection so a stop request can call
+        # interrupt() on it from the request thread.
+        execution.connection = database.connection()
+        outcome = _execute_submission(
+            dataset, sql, statements, page, ordering, explain, table_ctx,
+            want_count=want_count, stop_event=execution.stop_event)
+        execution.outcome = outcome
+    except Exception as exc:
+        app.logger.exception('Error running query.')
+        result = Result('error', sql, error=str(exc))
+        execution.outcome = dict(result=result, results=None, total=None,
+                                 total_pages=None, single_read=False,
+                                 stopped=False)
+    finally:
+        execution.connection = None
+        # Only this worker thread's connection exists in the thread-local
+        # state, so this never touches another request's connection.
+        try:
+            if not database.is_closed():
+                dataset.close()
+        except Exception:
+            # A dangling user transaction (BEGIN without COMMIT) makes a
+            # normal close raise; drop the raw connection so sqlite rolls it
+            # back, just as request teardown does.
+            try:
+                database._state.conn.close()
+            except Exception:
+                pass
+            database._state.reset()
+
+
+QUERY_RESULT_MARKER = '--sqlite-web-query-result--'
+QUERY_HEARTBEAT_INTERVAL = 2.0
+
+
+def _async_query_response(template, table, sql, statements, page, ordering,
+                          explain, table_ctx):
+    """Run one Execute submission in a worker and stream the rendered result
+    back. Heartbeat bytes keep the connection alive and let the server see a
+    closed tab, in which case the worker is interrupted rather than left
+    running with a dangling execution entry."""
+    dataset = table_ctx['dataset']
+    execution = QueryExecution(dataset.filename, None)
+    query_executions.add(execution)
+
+    thread = threading.Thread(
+        target=_query_worker,
+        args=(execution, dataset.filename, sql, statements, page, ordering,
+              explain, False, table_ctx),
+        name='sqlite-web-query-%s' % execution.id)
+    thread.daemon = True
+    thread.start()
+
+    # The response may be iterated after the original request context has
+    # been torn down (e.g. buffered test clients), so rebuild a matching
+    # context from the same environ. Template helpers like url_for need it.
+    environ = request.environ.copy()
+    session_snapshot = dict(session)
+
+    def generate():
+        try:
+            while True:
+                thread.join(timeout=QUERY_HEARTBEAT_INTERVAL)
+                if not thread.is_alive():
+                    break
+                # Writing this raises/GeneratorExit if the client is gone.
+                yield b' '
+            # The worker finished, so there is nothing stoppable any more:
+            # drop the entry before delivering the outcome. A stop request
+            # arriving now gets a 404 rather than masking the real result.
+            query_executions.remove(execution.id)
+            with app.request_context(environ):
+                # Keep session-based helpers (url_for cookie prefix, etc.)
+                # consistent with the submission request.
+                for key, value in session_snapshot.items():
+                    session[key] = value
+                payload = {'status': 'ok'}
+                outcome = execution.outcome
+                render_vars = _query_render_vars(
+                    table, sql, statements, page, ordering, explain, outcome,
+                    table_ctx)
+                if outcome['stopped']:
+                    payload['status'] = 'stopped'
+                payload['error'] = render_vars['error']
+                payload['html'] = render_template(
+                    'query_results.html', **render_vars)
+                yield (QUERY_RESULT_MARKER +
+                       json.dumps(payload).replace(QUERY_RESULT_MARKER, '') +
+                       QUERY_RESULT_MARKER)
+        finally:
+            if thread.is_alive():
+                # Client went away while the database was still computing:
+                # end the work and do not keep an execution around.
+                execution.request_stop()
+            query_executions.remove(execution.id)
+
+    response = Response(generate(), content_type='text/plain; charset=utf-8')
+    response.headers['X-Query-Execution-Id'] = execution.id
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+@app.route('/query/cancel/<execution_id>/', methods=['POST'])
+def query_cancel(execution_id):
+    # The id is an unguessable token handed only to the page that started
+    # the execution, so a stop targets exactly that execution. Cross-site
+    # POSTs are rejected by the Sec-Fetch-Site handler like any other POST.
+    execution = query_executions.get(execution_id)
+    if execution is None:
+        abort(404)
+    execution.request_stop()
+    return ('', 204)
+
+
 def _query_view(template, table=None):
     dataset = get_dataset()
     sql = request.values.get('sql') or ''
@@ -521,26 +824,12 @@ def _query_view(template, table=None):
     page = request.values.get('page') or ''
     page = max(int(page), 1) if page.isdigit() else 1
 
-    if table:
-        default_sql = 'SELECT * FROM %s' % quote_ident(table)
-        model_class = dataset[table].model_class
-        pk = model_class._meta.primary_key
-        is_composite_pk = isinstance(pk, CompositeKey)
-        allow_detail = dataset.cached_has_usable_pk(table)
-        allow_edit = allow_detail and not dataset.is_readonly
-        allow_bulk = allow_edit and not is_composite_pk
-        fk_lookup = dataset.cached_fk_lookup(table)
-    else:
-        default_sql = ''
-        model_class = dataset._base_model
-        pk = None
-        is_composite_pk = False
-        allow_detail = allow_edit = allow_bulk = False
-        fk_lookup = {}
+    table_ctx = _query_table_context(table)
 
     if request.method == 'POST' and request.form.get('action') == 'bulk-delete':
         values = _bulk_delete_values(request.form.getlist('pk'))
-        if not allow_bulk:
+        model_class = table_ctx['model_class']
+        if not table_ctx['allow_bulk']:
             flash('Cannot perform bulk operation on this table.', 'warning')
         elif not values:
             flash('No rows were selected.', 'warning')
@@ -556,72 +845,70 @@ def _query_view(template, table=None):
                 flash('Successfully deleted %s row(s)' % n, 'success')
 
     statements = split_statements(sql) if sql.strip() else []
-    single_read = len(statements) == 1 and is_read(dataset, sql)
+    single_read = bool(statements) and len(statements) == 1 and \
+        is_read(dataset, sql)
     # The bulk form re-submits the sql, so only offer it for reads.
-    allow_bulk = allow_bulk and single_read
+    allow_bulk = table_ctx['allow_bulk'] and single_read
 
     if export_format and statements:
         if not single_read:
             flash('Only a single query may be exported.', 'warning')
         else:
             qsql = wrap(sql, ordering) if ordering else sql.rstrip('; \t\r\n')
-            return export(model_class.raw(qsql).dicts(), export_format, table)
+            return export(table_ctx['model_class'].raw(qsql).dicts(),
+                          export_format, table)
 
-    result = results = total = total_pages = None
-    rpp = app.config['QUERY_ROWS_PER_PAGE']
+    outcome = dict(result=None, results=None, total=None, total_pages=None,
+                   single_read=single_read, stopped=False)
     if statements and export_format is None:
         if request.method == 'GET' and not single_read:
             # Writes and scripts only execute via POST.
             flash('Press Execute to run this statement.', 'info')
         elif explain and len(statements) > 1:
             flash('Only a single statement may be explained.', 'warning')
+        elif request.method == 'POST' and \
+                request.headers.get('X-Sqliteweb-Query') == 'execute':
+            # Asynchronous, interruptible Execute (plain Execute only: the
+            # JSON/CSV/Explain submit buttons are not marked this way).
+            return _async_query_response(
+                template, table, sql, statements, page, ordering, explain,
+                table_ctx)
         elif len(statements) == 1:
             # EXPLAIN QUERY PLAN compiles the statement without running it.
             run_sql = 'EXPLAIN QUERY PLAN %s' % sql if explain else sql
-            result = run_one(dataset, run_sql, page=page, page_size=rpp,
-                             ordering=ordering)
+            outcome.update(_execute_submission(
+                dataset, sql, statements, page, ordering, explain, table_ctx,
+                want_count='count' in request.values,
+                single_read=single_read))
         else:
-            results = run_script(dataset, statements, page_size=rpp)
+            outcome.update(_execute_submission(
+                dataset, sql, statements, page, ordering, explain, table_ctx,
+                single_read=single_read))
 
-    if (result is not None and result.kind == 'rows' and allow_detail and
-            not explain and not is_composite_pk and
-            pk.column_name in result.columns):
-        pk_index = result.columns.index(pk.column_name)  # First one wins.
-        result.keys = [key_encode([row[pk_index]]) for row in result.rows]
-
-    if result is not None and result.kind == 'rows' and \
-       'count' in request.values:
-        try:
-            total, = dataset.query(wrap(sql, select='COUNT(*)')).fetchone()
-            total_pages = max(1, int(math.ceil(total / float(rpp))))
-        except Exception:
-            total = total_pages = None
-
-    error = None
-    if result is not None and result.kind == 'error':
-        error = result.error
+    render_vars = _query_render_vars(
+        table, sql, statements, page, ordering, explain, outcome, table_ctx)
+    # These are passed explicitly below (or computed elsewhere), so do not
+    # duplicate them into render_template.
+    inline_keys = ('fk_lookup', 'ordering', 'page', 'sql', 'table',
+                   'total_statements')
+    result_vars = {k: v for k, v in render_vars.items()
+                   if k not in inline_keys}
 
     return render_template(
         template,
         allow_bulk=allow_bulk,
-        allow_detail=allow_detail,
-        allow_edit=allow_edit,
-        default_sql=default_sql,
-        error=error,
-        fk_lookup=fk_lookup,
+        allow_detail=table_ctx['allow_detail'],
+        allow_edit=table_ctx['allow_edit'],
+        default_sql=table_ctx['default_sql'],
+        fk_lookup=table_ctx['fk_lookup'],
         ordering=ordering,
         page=page,
-        page_start=(page - 1) * rpp + 1,
-        paginate=single_read and not explain,
         query_images=get_query_images(),
-        result=result,
-        results=results,
         sql=sql,
         table=table,
         table_sql=dataset.cached_table_sql(table),
-        total=total,
-        total_pages=total_pages,
-        total_statements=len(statements))
+        total_statements=len(statements),
+        **result_vars)
 
 @app.route('/query/', methods=['GET', 'POST'])
 def generic_query():

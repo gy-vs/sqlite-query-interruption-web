@@ -9,7 +9,14 @@
     {% endif %}
   </div>
   {# Execute is the page's one primary verb, everything else is small. #}
-  <button class="btn btn-primary" type="submit">Execute</button>
+  <button class="btn btn-primary" id="execute-button" type="submit">
+    <span class="spinner-border spinner-border-sm d-none" id="execute-spinner" role="status" aria-hidden="true"></span>
+    <span id="execute-label">Execute</span>
+  </button>
+  <button class="btn btn-danger d-none" id="stop-button" type="button">
+    <span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span>
+    Stop
+  </button>
   <div class="btn-group ml-2" role="group">
     <button class="btn btn-sm btn-outline-secondary" name="export_json" type="submit">JSON</button>
     <button class="btn btn-sm btn-outline-secondary" name="export_csv" type="submit">CSV</button>

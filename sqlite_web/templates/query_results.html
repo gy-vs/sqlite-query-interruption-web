@@ -1,0 +1,50 @@
+{# Results area for the query page. Shared by the full-page render (GET,
+   pagination, native POST) and the asynchronous Execute swap. #}
+{% if results %}
+  {% for result in results %}
+    <div class="script-result">
+      <p><code>{{ result.statement|truncate(120, True) }}</code></p>
+      {% set in_script = True %}
+      {% if result.kind == 'stopped' %}
+        <div class="alert alert-warning">Query stopped.</div>
+      {% else %}
+        {% include "results.html" %}
+      {% endif %}
+    </div>
+  {% endfor %}
+  {% if total_statements > results|length %}
+    <div class="alert alert-warning">
+      Execution stopped: {{ total_statements - results|length }} remaining
+      statement(s) did not run.
+    </div>
+  {% endif %}
+{% elif result and result.kind != 'error' %}
+  {% if result.kind == 'stopped' %}
+    <div class="alert alert-warning" role="status">
+      <strong>Query stopped.</strong>
+      {% if result.statement %}The statement was interrupted before it
+      finished.{% endif %}
+    </div>
+  {% else %}
+    {% if result.kind == 'rows' and result.rows %}
+      {% if show_bulk_form %}
+        <form action="." autocomplete="off" method="post">
+          <input name="sql" type="hidden" value="{{ sql }}" />
+      {% endif %}
+      <a class="small float-right" href="{{ url_for(request.endpoint, table=table, sql=sql) }}{% if ordering %}&ordering={{ ordering }}{% endif %}{% if page > 1 %}&page={{ page }}{% endif %}">Permalink</a>
+      <h3>Results ({{ page_start }}&ndash;{{ page_start + result.rows|length - 1 }}{% if total is not none %} of {{ total }}{% endif %})</h3>
+    {% endif %}
+    {% include "results.html" %}
+    {% if result.kind == 'rows' and result.rows %}
+      {% if show_bulk_form %}
+        <div class="float-right">
+          <button class="btn btn-sm btn-danger bulk-action" disabled name="action" type="submit" value="bulk-delete">Bulk Delete</button>
+        </div>
+        </form>
+      {% endif %}
+      {% if paginate %}
+        {% include "pagination.html" %}
+      {% endif %}
+    {% endif %}
+  {% endif %}
+{% endif %}

@@ -2,6 +2,8 @@ import os
 import shutil
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 
 from peewee import SqliteDatabase
@@ -9,6 +11,7 @@ from playhouse.dataset import DataSet
 
 from sqlite_web import sqlite_web as sw
 from sqlite_web.executor import Result
+from sqlite_web.executor import is_interrupt_error
 from sqlite_web.executor import is_read
 from sqlite_web.executor import key_decode
 from sqlite_web.executor import key_encode
@@ -184,6 +187,141 @@ class TestRunScript(BaseExecutorTestCase):
             db.close()
 
 
+def big_join_sql():
+    return 'SELECT count(*) FROM big a, big b, big c'
+
+
+class InterruptibleWorker:
+    """Runs an executor call on its own connection in a thread, like the
+    query view does, and exposes the raw connection for interrupt()."""
+    def __init__(self, path, fn):
+        self.path = path
+        self.fn = fn
+        self.error = None
+        self.result = None
+        self.ready = threading.Event()
+        self.conn = None
+
+    def _run(self):
+        db = SqliteDatabase(self.path)
+        ds = DataSet(db)
+        # DataSet.__init__ opens the connection; it belongs to this thread.
+        self.conn = db.connection()
+        self.ready.set()
+        try:
+            self.result = self.fn(ds)
+        except Exception as exc:
+            self.error = exc
+        finally:
+            if not db.is_closed():
+                db.close()
+    def start(self):
+        self.thread = threading.Thread(target=self._run)
+        self.thread.daemon = True
+        self.thread.start()
+        self.ready.wait(5)
+        return self
+
+
+class TestInterrupt(BaseExecutorTestCase):
+    def test_run_one_reports_stopped_on_interrupt(self):
+        stop = threading.Event()
+
+        def run(ds):
+            return run_one(ds, big_join_sql(), stop_event=stop)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, 'big.db')
+            conn = sqlite3.connect(path)
+            conn.execute('CREATE TABLE big (x)')
+            conn.execute('INSERT INTO big VALUES (1),(2),(3),(4),(5),(6),'
+                         '(7),(8)')
+            for _ in range(12):
+                conn.execute('INSERT INTO big SELECT x FROM big')
+            conn.commit()
+            conn.close()
+
+            worker = InterruptibleWorker(path, run).start()
+            # Wait until the heavy join is demonstrably running.
+            deadline = time.time() + 5
+            while worker.conn is None and time.time() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.2)
+            self.assertIsNotNone(worker.conn)
+            stop.set()
+            worker.conn.interrupt()
+            worker.thread.join(5)
+            self.assertFalse(worker.thread.is_alive())
+            self.assertIsNone(worker.error)
+            self.assertEqual(worker.result.kind, 'stopped')
+
+    def test_stop_before_unwrapped_write_does_not_run_it(self):
+        # A stop after the wrapped probe fails on a DML statement must not
+        # fall through to execute the write.
+        stop = threading.Event()
+        stop.set()
+        r = run_one(self.dataset,
+                    "INSERT INTO users (username) VALUES ('late')",
+                    stop_event=stop)
+        self.assertEqual(r.kind, 'stopped')
+        self.assertEqual(self.user_count(), 3)
+
+    def test_run_script_marks_stopped_and_skips_rest(self):
+        stop = threading.Event()
+        stop.set()
+        results = run_script(
+            self.dataset,
+            ["INSERT INTO users (username) VALUES ('a')",
+             'SELECT * FROM users'],
+            stop_event=stop)
+        # The event is already set before any work starts: the first
+        # statement itself comes back stopped and nothing further runs.
+        self.assertEqual([r.kind for r in results], ['stopped'])
+        self.assertEqual(self.user_count(), 3)
+
+    def test_run_script_interrupted_midway_keeps_earlier_results(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, 'big.db')
+            conn = sqlite3.connect(path)
+            conn.execute('CREATE TABLE big (x)')
+            conn.execute('CREATE TABLE marker (id INTEGER)')
+            conn.execute('INSERT INTO big VALUES (1),(2),(3),(4)')
+            for _ in range(10):
+                conn.execute('INSERT INTO big SELECT x FROM big')
+            conn.commit()
+            conn.close()
+
+            stop = threading.Event()
+
+            def run(ds):
+                return run_script(ds, split_statements(
+                    "INSERT INTO marker VALUES (1); %s; "
+                    "INSERT INTO marker VALUES (2);" % big_join_sql()),
+                    stop_event=stop)
+
+            worker = InterruptibleWorker(path, run).start()
+            time.sleep(0.15)
+            stop.set()
+            worker.conn.interrupt()
+            worker.thread.join(5)
+            self.assertIsNone(worker.error)
+            kinds = [r.kind for r in worker.result]
+            self.assertEqual(kinds[0], 'affected')  # Completed insert.
+            self.assertIn('stopped', kinds)
+            # Statements after the stopped one never ran.
+            conn = sqlite3.connect(path)
+            self.assertEqual(
+                [r for r, in conn.execute('SELECT id FROM marker')], [1])
+            conn.close()
+
+    def test_is_interrupt_error(self):
+        class Fake(Exception):
+            sqlite_errorcode = 9
+            sqlite_errorname = 'SQLITE_INTERRUPT'
+        self.assertTrue(is_interrupt_error(Fake()))
+        self.assertFalse(is_interrupt_error(Exception('no such column')))
+
+
 class TestIsRead(BaseExecutorTestCase):
     def test_is_read(self):
         self.assertTrue(is_read(self.dataset, 'SELECT * FROM users'))
@@ -298,6 +436,182 @@ class TestExecutionPolicy(BaseAppTestCase):
                                               'export_csv': '1'})
         self.assertIn(b'Only a single query may be exported', r.data)
         self.assertTrue(self.dbrows('SELECT COUNT(*) FROM users'))
+
+
+class TestQueryCancellation(BaseAppTestCase):
+    def setUp(self):
+        super().setUp()
+        # A table large enough that its triple join clearly outlasts the
+        # test's stop request.
+        conn = sqlite3.connect(self.db_path)
+        conn.execute('CREATE TABLE big (x)')
+        conn.execute('INSERT INTO big VALUES (1),(2),(3),(4),(5),(6),'
+                     '(7),(8)')
+        for _ in range(11):
+            conn.execute('INSERT INTO big SELECT x FROM big')
+        conn.commit()
+        conn.close()
+        sw.QUERY_HEARTBEAT_INTERVAL = 0.1
+
+    def tearDown(self):
+        sw.QUERY_HEARTBEAT_INTERVAL = 2.0
+        for execution in sw.query_executions.clear_all():
+            execution.request_stop()
+        super().tearDown()
+
+    def _execute(self, sql, buffered=False):
+        return self.client.post(
+            '/query/', data={'sql': sql},
+            headers={'X-Sqliteweb-Query': 'execute'},
+            buffered=buffered)
+
+    def _payload(self, response):
+        import json
+        data = response.get_data(as_text=True)
+        marker = sw.QUERY_RESULT_MARKER
+        return json.loads(data.split(marker)[1])
+
+    def test_fast_query_streams_real_result(self):
+        r = self._execute('SELECT * FROM users')
+        self.assertEqual(r.status_code, 200)
+        self.assertRegex(r.headers['X-Query-Execution-Id'], r'^[0-9a-f]{32}$')
+        payload = self._payload(r)
+        self.assertEqual(payload['status'], 'ok')
+        self.assertIn('huey', payload['html'])
+        self.assertNotIn('Query stopped', payload['html'])
+        # The entry is removed once the outcome has been delivered.
+        self.assertEqual(sw.query_executions._executions, {})
+
+    def test_sql_error_is_distinct_from_stopped(self):
+        r = self._execute('SELECT nocolumn FROM users')
+        payload = self._payload(r)
+        self.assertEqual(payload['status'], 'ok')
+        self.assertIn('no such column', payload['error'])
+        self.assertNotIn('Query stopped', payload['html'])
+
+    def test_cancel_interrupts_running_query(self):
+        response = self._execute(big_join_sql(), buffered=False)
+        chunks = iter(response.response)
+        execution_id = response.headers['X-Query-Execution-Id']
+        self.assertIn(execution_id, sw.query_executions._executions)
+
+        cancel = self.client.post('/query/cancel/%s/' % execution_id)
+        self.assertEqual(cancel.status_code, 204)
+
+        body = b''.join(chunks)
+        response.response.close()
+        payload = self._payload_from(body)
+        self.assertEqual(payload['status'], 'stopped')
+        self.assertIn('Query stopped', payload['html'])
+        self.assertNotIn(execution_id, sw.query_executions._executions)
+
+    def _payload_from(self, body_bytes):
+        import json
+        text = body_bytes.decode()
+        marker = sw.QUERY_RESULT_MARKER
+        return json.loads(text.split(marker)[1])
+
+    def test_late_cancel_keeps_completed_result(self):
+        r = self._execute('SELECT * FROM users')
+        execution_id = r.headers['X-Query-Execution-Id']
+        # Fully consumed before the stop request: the execution is gone.
+        cancel = self.client.post('/query/cancel/%s/' % execution_id)
+        self.assertEqual(cancel.status_code, 404)
+        payload = self._payload(r)
+        self.assertEqual(payload['status'], 'ok')
+        self.assertIn('huey', payload['html'])
+
+    def test_unknown_cancel_404s(self):
+        self.assertEqual(self.client.post('/query/cancel/deadbeef/').status_code,
+                         404)
+
+    def test_cancel_requires_post(self):
+        self.assertEqual(self.client.get('/query/cancel/deadbeef/').status_code,
+                         405)
+
+    def test_cross_site_cancel_rejected(self):
+        response = self._execute(big_join_sql(), buffered=False)
+        chunks = iter(response.response)
+        execution_id = response.headers['X-Query-Execution-Id']
+        cancel = self.client.post(
+            '/query/cancel/%s/' % execution_id,
+            headers={'Sec-Fetch-Site': 'cross-site'})
+        self.assertEqual(cancel.status_code, 403)
+        self.client.post('/query/cancel/%s/' % execution_id)
+        b''.join(chunks)
+        response.response.close()
+
+    def test_script_stop_keeps_completed_skips_rest(self):
+        script = ('INSERT INTO users (username) VALUES (\'a\');'
+                  '%s;'
+                  'INSERT INTO users (username) VALUES (\'b\');'
+                  % big_join_sql())
+        response = self._execute(script, buffered=False)
+        chunks = iter(response.response)
+        execution_id = response.headers['X-Query-Execution-Id']
+        self.client.post('/query/cancel/%s/' % execution_id)
+        payload = self._payload_from(b''.join(chunks))
+        response.response.close()
+        self.assertEqual(payload['status'], 'stopped')
+        self.assertIn('Rows modified', payload['html'])
+        self.assertIn('did not run', payload['html'])
+        # First insert persisted; the one after the stop did not.
+        self.assertEqual(
+            self.dbrows('SELECT username FROM users ORDER BY id'),
+            [('huey',), ('mickey',), ('zaizee',), ('a',)])
+
+    def test_write_after_stop_works(self):
+        response = self._execute(big_join_sql(), buffered=False)
+        chunks = iter(response.response)
+        execution_id = response.headers['X-Query-Execution-Id']
+        self.client.post('/query/cancel/%s/' % execution_id)
+        self.assertEqual(self._payload_from(b''.join(chunks))['status'],
+                         'stopped')
+        response.response.close()
+
+        followup = self._execute(
+            "INSERT INTO users (username) VALUES ('next')")
+        self.assertEqual(followup.status_code, 200)
+        self.assertIn('Rows modified', self._payload(followup)['html'])
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM users')[0][0], 4)
+
+    def test_disconnect_interrupts_and_cleans_up(self):
+        response = self._execute(big_join_sql(), buffered=False)
+        chunks = iter(response.response)
+        next(chunks)  # One heartbeat: the server sees a live consumer.
+        execution_id = response.headers['X-Query-Execution-Id']
+        response.response.close()  # The tab goes away.
+
+        deadline = time.time() + 5
+        while execution_id in sw.query_executions._executions and \
+                time.time() < deadline:
+            time.sleep(0.05)
+        self.assertNotIn(execution_id, sw.query_executions._executions)
+
+    def test_async_carries_no_export_semantics(self):
+        # The async header marks plain Execute only; the export buttons
+        # still stream a file download and writes stay POST-only.
+        r = self.client.post('/query/',
+                             data={'sql': 'SELECT * FROM users',
+                                   'export_csv': '1'},
+                             headers={'X-Sqliteweb-Query': 'execute'})
+        self.assertNotIn('X-Query-Execution-Id', r.headers)
+        self.assertEqual(r.headers['Content-Type'], 'text/csv')
+
+    def test_pagination_remains_native_post(self):
+        # Pagination posts carry no async header and render the full page.
+        r = self.client.post('/query/', data={'sql': 'SELECT * FROM users',
+                                              'page': '1'})
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn('X-Query-Execution-Id', r.headers)
+        self.assertIn(b'huey', r.data)
+
+    def test_stop_button_present_only_in_markup(self):
+        r = self.client.get('/query/')
+        self.assertIn(b'id="stop-button"', r.data)
+        self.assertIn(b'd-none', r.data)  # Hidden until an execution runs.
+        self.assertIn(b'id="execute-spinner"', r.data)
+        self.assertIn(b'/query/cancel/', r.data)
 
 
 class TestValueFilter(unittest.TestCase):
