@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import webbrowser
 from collections import namedtuple, OrderedDict
 from functools import reduce
@@ -78,12 +79,12 @@ from playhouse.migrate import migrate
 
 try:
     from sqlite_web.executor import (
-        Result, is_read, key_decode, key_encode, run_one, run_script,
-        split_statements, wrap)
+        Result, is_interrupt_error, is_read, key_decode, key_encode, run_one,
+        run_script, split_statements, wrap)
 except ImportError:
     from executor import (
-        Result, is_read, key_decode, key_encode, run_one, run_script,
-        split_statements, wrap)
+        Result, is_interrupt_error, is_read, key_decode, key_encode, run_one,
+        run_script, split_statements, wrap)
 
 
 CUR_DIR = os.path.realpath(os.path.dirname(__file__))
@@ -104,6 +105,17 @@ app.config.from_object(__name__)
 datasets = {}
 datasets_lock = threading.Lock()
 dataset_config = {}
+
+# In-flight query executions. Each tab's Execute spawns its own worker thread
+# (and thus its own SQLite connection), so a stop interrupts exactly one
+# execution. Keyed by a random id the owning browser polls with.
+executions = {}
+executions_lock = threading.Lock()
+EXECUTION_FINISHED_TTL = 600  # Keep finished outcomes for 10 minutes.
+# A query that finishes within this window renders straight into the POST
+# response, so fast queries behave exactly as before. Only work that is still
+# running is moved to the pollable running page.
+FAST_EXECUTION_TIMEOUT = 0.5
 
 #
 # Database metadata objects.
@@ -498,9 +510,250 @@ def unload():
 
     return render_template('unload.html', selected=dataset)
 
+#
+# Query execution: long-running statements run in a worker thread with their
+# own SQLite connection, so the page keeps responding and a stop can interrupt
+# the database computation itself.
+#
+
+def prune_executions(now=None):
+    # Drop outcomes whose short TTL expired. Running executions are never
+    # pruned; an orphaned thread that eventually completes writes its outcome
+    # and the next prune collects it.
+    now = now if now is not None else time.time()
+    with executions_lock:
+        stale = [eid for eid, ex in executions.items()
+                 if ex['status'] != 'running' and
+                 now - ex['finished_at'] > EXECUTION_FINISHED_TTL]
+        for eid in stale:
+            del executions[eid]
+
+
+def _threading_is_gevent_patched():
+    # The optional gevent server turns threading.Thread into a greenlet. The
+    # worker must still run on a real OS thread so a blocked SQLite statement
+    # does not freeze the hub that serves the stop request.
+    try:
+        from gevent import monkey
+    except ImportError:
+        return False
+    return monkey.is_module_patched('threading')
+
+
+if _threading_is_gevent_patched():  # Import-time: wsgi_server patches first.
+    from gevent import monkey as _gevent_monkey
+    native_threading = _gevent_monkey.get_original('threading')
+else:
+    native_threading = threading
+
+
+def _interrupt_connection(conn):
+    # sqlite3.interrupt only sets a flag, so it is safe to call directly from
+    # the request thread/greenlet.
+    try:
+        conn.interrupt()
+    except Exception:
+        pass
+
+
+def get_owned_execution(execution_id, dataset):
+    # A tab may only see the execution it started, and only for the database
+    # it is currently viewing.
+    prune_executions()
+    if not execution_id:
+        return
+    ex = executions.get(execution_id)
+    if ex is None or ex['owner'] != session.get('execution_owner'):
+        abort(404)
+    if ex['dataset_key'] != dataset.filename:
+        abort(404)
+    return ex
+
+
+def _query_worker(execution_id, dataset_key, sql, statements, single_read,
+                  page, rpp, ordering, explain, want_count, table_name,
+                  allow_detail, is_composite_pk, pk_column):
+    current = threading.current_thread()
+    current.cancel_event = native_threading.Event()
+    ex = executions[execution_id]
+    # Publish the event before touching the database, so a stop that arrives
+    # while the worker is still starting up is not lost.
+    ex['cancel_event'] = current.cancel_event
+    if ex.get('cancel_requested'):
+        current.cancel_event.set()
+    dataset = None
+    try:
+        dataset = datasets[dataset_key]
+        dataset.connect()
+        if dataset_config.get('startup_hook'):
+            dataset_config['startup_hook'](dataset._database)
+        conn = dataset._database.connection()
+
+        def interrupt_connection():
+            try:
+                conn.interrupt()
+            except Exception:
+                pass
+        ex['interrupt'] = interrupt_connection
+
+        result = results = total = total_pages = None
+        if len(statements) == 1:
+            run_sql = 'EXPLAIN QUERY PLAN %s' % statements[0] if explain \
+                else statements[0]
+            result = run_one(dataset, run_sql, page=page, page_size=rpp,
+                             ordering=ordering,
+                             cancel_event=current.cancel_event)
+            if result is not None and result.kind == 'rows' and \
+                    allow_detail and not explain and not is_composite_pk and \
+                    pk_column in result.columns:
+                pk_index = result.columns.index(pk_column)  # First wins.
+                result.keys = [key_encode([row[pk_index]])
+                               for row in result.rows]
+            if result is not None and result.kind == 'rows' and want_count:
+                try:
+                    total, = dataset.query(
+                        wrap(sql, select='COUNT(*)')).fetchone()
+                    total_pages = max(
+                        1, int(math.ceil(total / float(rpp))))
+                except Exception:
+                    total = total_pages = None
+        else:
+            results = run_script(dataset, statements, page_size=rpp,
+                                 cancel_event=current.cancel_event)
+
+        error = None
+        if result is not None and result.kind == 'error':
+            error = result.error
+
+        ex.update(
+            status='finished',
+            result=result,
+            results=results,
+            total=total,
+            total_pages=total_pages,
+            error=error,
+            finished_at=time.time())
+        ex['done'].set()
+    except Exception as exc:
+        app.logger.exception('Query execution failed.')
+        ex.update(
+            status='finished',
+            result=Result('error', sql, error=str(exc)),
+            results=None,
+            total=None,
+            total_pages=None,
+            error=str(exc),
+            finished_at=time.time())
+        ex['done'].set()
+    finally:
+        try:
+            dataset.close()
+        except Exception:
+            pass
+
+
+def start_execution(dataset, **kwargs):
+    owner = session.get('execution_owner')
+    if not owner:
+        owner = uuid.uuid4().hex
+        session['execution_owner'] = owner
+    execution_id = uuid.uuid4().hex
+    ex = {
+        'owner': owner,
+        'dataset_key': dataset.filename,
+        'sql': kwargs['sql'],
+        'table': kwargs.get('table_name'),
+        'ordering': kwargs.get('ordering'),
+        'page': kwargs.get('page'),
+        'status': 'running',
+        'started_at': time.time(),
+        'finished_at': None,
+        'cancel_requested': False,
+        'cancel_event': None,
+        'interrupt': None,
+        'done': native_threading.Event(),
+        'result': None,
+        'results': None,
+        'total': None,
+        'total_pages': None,
+        'error': None,
+    }
+    executions[execution_id] = ex
+    prune_executions(ex['started_at'])
+    worker = native_threading.Thread(
+        target=_query_worker,
+        args=(execution_id, dataset.filename),
+        kwargs=kwargs)
+    worker.daemon = True
+    worker.start()
+    return execution_id
+
+
+def wait_for_done(event, timeout):
+    # Fast queries block the request for at most FAST_EXECUTION_TIMEOUT.
+    # Under gevent a native Event.wait() would freeze the event loop, so
+    # poll it in short slices and yield to the hub instead.
+    if not _threading_is_gevent_patched():
+        return event.wait(timeout)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if event.is_set():
+            return True
+        time.sleep(0.01)  # Patched by gevent: yields the hub.
+    return event.is_set()
+
+
+def _render_query(template, dataset, table, sql, result, results, error,
+                  ordering, page, total, total_pages, single_read, explain,
+                  statements, execution_id=None):
+    rpp = app.config['QUERY_ROWS_PER_PAGE']
+    if table:
+        allow_detail = dataset.cached_has_usable_pk(table)
+        allow_edit = allow_detail and not dataset.is_readonly
+        model_class = dataset[table].model_class
+        is_composite_pk = isinstance(
+            model_class._meta.primary_key, CompositeKey)
+        allow_bulk = (allow_edit and not is_composite_pk and single_read and
+                      result is not None and result.keys is not None)
+        fk_lookup = dataset.cached_fk_lookup(table)
+        table_sql = dataset.cached_table_sql(table)
+    else:
+        model_class = dataset._base_model
+        allow_detail = allow_edit = allow_bulk = False
+        is_composite_pk = False
+        fk_lookup = {}
+        table_sql = None
+
+    running = execution_id is not None and result is None and results is None
+    return render_template(
+        template,
+        allow_bulk=allow_bulk,
+        allow_detail=allow_detail,
+        allow_edit=allow_edit,
+        default_sql='SELECT * FROM %s' % quote_ident(table) if table else '',
+        error=error,
+        execution_id=execution_id,
+        fk_lookup=fk_lookup,
+        ordering=ordering,
+        page=page,
+        page_start=(page - 1) * rpp + 1,
+        paginate=single_read and not explain,
+        query_images=get_query_images(),
+        result=result,
+        results=results,
+        running=running,
+        sql=sql,
+        table=table,
+        table_sql=table_sql,
+        total=total,
+        total_pages=total_pages,
+        total_statements=len(statements))
+
+
 def _query_view(template, table=None):
     dataset = get_dataset()
     sql = request.values.get('sql') or ''
+    execution_id = request.values.get('execution') or None
 
     export_format = None
     explain = False
@@ -520,6 +773,7 @@ def _query_view(template, table=None):
 
     page = request.values.get('page') or ''
     page = max(int(page), 1) if page.isdigit() else 1
+    rpp = app.config['QUERY_ROWS_PER_PAGE']
 
     if table:
         default_sql = 'SELECT * FROM %s' % quote_ident(table)
@@ -567,21 +821,70 @@ def _query_view(template, table=None):
             qsql = wrap(sql, ordering) if ordering else sql.rstrip('; \t\r\n')
             return export(model_class.raw(qsql).dicts(), export_format, table)
 
+    # A finished execution is rendered from its stored outcome -- the SQL is
+    # never re-run, so a page refresh cannot repeat a write.
+    if execution_id:
+        ex = get_owned_execution(execution_id, dataset)
+        if ex['status'] == 'running':
+            return _render_query(
+                template, dataset, table, sql, None, None, None,
+                ordering, page, None, None, single_read, explain,
+                statements, execution_id=execution_id)
+        return _render_query(
+            template, dataset, table, sql,
+            ex['result'], ex['results'], ex['error'],
+            ordering, page, ex['total'], ex['total_pages'],
+            single_read, explain, statements)
+
     result = results = total = total_pages = None
-    rpp = app.config['QUERY_ROWS_PER_PAGE']
     if statements and export_format is None:
         if request.method == 'GET' and not single_read:
             # Writes and scripts only execute via POST.
             flash('Press Execute to run this statement.', 'info')
         elif explain and len(statements) > 1:
             flash('Only a single statement may be explained.', 'warning')
+        elif request.method == 'POST':
+            # Hand the work to a worker thread and render a running page if
+            # it does not finish within a short window; the browser then
+            # polls, so a stop request reaches a live request thread and can
+            # interrupt this exact execution. Fast queries render inline.
+            want_count = 'count' in request.values
+            execution_id = start_execution(
+                dataset,
+                sql=sql,
+                table_name=table,
+                statements=statements,
+                single_read=single_read,
+                page=page,
+                rpp=rpp,
+                ordering=ordering,
+                explain=explain,
+                want_count=want_count,
+                allow_detail=allow_detail,
+                is_composite_pk=is_composite_pk,
+                pk_column=pk.column_name if pk else None)
+            ex = executions[execution_id]
+            if not wait_for_done(ex['done'], FAST_EXECUTION_TIMEOUT):
+                return redirect(url_for(
+                    request.endpoint,
+                    **({} if table is None else {'table': table}),
+                    sql=sql,
+                    execution=execution_id,
+                    **({'ordering': ordering} if ordering else {}),
+                    **({'page': page} if page > 1 else {})), code=303)
+            # Fast enough to render directly; keep the 200 POST behavior.
+            return _render_query(
+                template, dataset, table, sql,
+                ex['result'], ex['results'], ex['error'],
+                ordering, page, ex['total'], ex['total_pages'],
+                single_read, explain, statements)
         elif len(statements) == 1:
-            # EXPLAIN QUERY PLAN compiles the statement without running it.
-            run_sql = 'EXPLAIN QUERY PLAN %s' % sql if explain else sql
-            result = run_one(dataset, run_sql, page=page, page_size=rpp,
+            # GET single read: permalink / pagination navigation, executed
+            # synchronously as before.
+            result = run_one(dataset, sql, page=page, page_size=rpp,
                              ordering=ordering)
         else:
-            results = run_script(dataset, statements, page_size=rpp)
+            results = None
 
     if (result is not None and result.kind == 'rows' and allow_detail and
             not explain and not is_composite_pk and
@@ -601,31 +904,50 @@ def _query_view(template, table=None):
     if result is not None and result.kind == 'error':
         error = result.error
 
-    return render_template(
-        template,
-        allow_bulk=allow_bulk,
-        allow_detail=allow_detail,
-        allow_edit=allow_edit,
-        default_sql=default_sql,
-        error=error,
-        fk_lookup=fk_lookup,
-        ordering=ordering,
-        page=page,
-        page_start=(page - 1) * rpp + 1,
-        paginate=single_read and not explain,
-        query_images=get_query_images(),
-        result=result,
-        results=results,
-        sql=sql,
-        table=table,
-        table_sql=dataset.cached_table_sql(table),
-        total=total,
-        total_pages=total_pages,
-        total_statements=len(statements))
+    return _render_query(
+        template, dataset, table, sql, result, results, error,
+        ordering, page, total, total_pages, single_read, explain,
+        statements)
+
 
 @app.route('/query/', methods=['GET', 'POST'])
 def generic_query():
     return _query_view('query.html')
+
+
+@app.route('/query/execution/<execution_id>/', methods=['GET', 'POST'])
+def query_execution(execution_id):
+    dataset = get_dataset()
+    ex = get_owned_execution(execution_id, dataset)
+    if request.method == 'POST':
+        # Stop this one execution only. Setting the flag first means that if
+        # the statement finishes in the same instant, the worker's completed
+        # status and real result win; the stop cannot be reported for a query
+        # that actually finished.
+        running = ex['status'] == 'running'
+        if running:
+            ex['cancel_requested'] = True
+            cancel_event = ex.get('cancel_event')
+            if cancel_event is not None:
+                cancel_event.set()
+            interrupt = ex.get('interrupt')
+            if interrupt is not None:
+                interrupt()
+        return jsonify({'status': 'stopping' if running else ex['status']})
+    if ex['status'] == 'running':
+        return jsonify({'status': 'running'})
+    kwargs = {'sql': ex['sql'], 'execution': execution_id}
+    if ex.get('ordering'):
+        kwargs['ordering'] = ex['ordering']
+    if ex.get('page') and ex['page'] > 1:
+        kwargs['page'] = ex['page']
+    if ex.get('table'):
+        endpoint = 'table_query'
+        kwargs['table'] = ex['table']
+    else:
+        endpoint = 'generic_query'
+    return jsonify({'status': 'finished',
+                    'url': url_for(endpoint, **kwargs)})
 
 def require_table(fn):
     @wraps(fn)

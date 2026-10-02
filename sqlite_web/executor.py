@@ -8,7 +8,7 @@ from peewee import sqlite3
 
 @dataclass
 class Result:
-    kind: str  # 'rows', 'affected', 'error'
+    kind: str  # 'rows', 'affected', 'error', 'stopped'
     statement: str = ''
     columns: list = field(default_factory=list)
     rows: list = field(default_factory=list)
@@ -16,6 +16,15 @@ class Result:
     has_next: bool = False
     affected: int = -1
     error: str = ''
+
+
+def is_interrupt_error(exc):
+    # An interrupt arrives as sqlite3's OperationalError('interrupted'); a
+    # driver that wraps dbapi errors keeps the same args/type name.
+    if str(exc) != 'interrupted':
+        return False
+    return (isinstance(exc, sqlite3.OperationalError) or
+            type(exc).__name__ == 'OperationalError')
 
 
 def wrap(sql, ordering=None, limit=None, offset=0, select='*'):
@@ -31,29 +40,54 @@ def wrap(sql, ordering=None, limit=None, offset=0, select='*'):
     return wrapped
 
 
-def run_one(dataset, sql, page=1, page_size=50, ordering=None):
+def run_one(dataset, sql, page=1, page_size=50, ordering=None,
+            cancel_event=None):
     # The query box allows whatever kinds of query/ies. We wrap the user query
     # to provide ordering + pagination, but cannot wrap DDL or DML statements.
     # Rather than try to parse the user SQL, attempt to wrap + execute (this
     # only works for SELECTs), and on failure fall-back to unwrapped.
     page = max(page, 1)
+
+    def interrupted(exc):
+        return cancel_event is not None and \
+            cancel_event.is_set() and is_interrupt_error(exc)
+
+    if cancel_event is not None and cancel_event.is_set():
+        # A stop that arrived before this statement started: do not issue the
+        # SQL at all.
+        return Result('stopped', sql)
+
     try:
         # Fetch page_size + 1 rows so a "next" page can be detected.
         cursor = dataset.query(wrap(sql, ordering, page_size + 1,
                                     (page - 1) * page_size))
         paged = True
-    except DatabaseError:
+    except DatabaseError as exc:
+        if interrupted(exc):
+            return Result('stopped', sql)
         try:
             cursor = dataset.query(sql)
             paged = False
         except Exception as exc:
+            if interrupted(exc):
+                return Result('stopped', sql)
             return Result('error', sql, error=str(exc))
+    except Exception as exc:
+        # The dbapi OperationalError may surface unwrapped.
+        if interrupted(exc):
+            return Result('stopped', sql)
+        raise
 
     if cursor.description is None:
         return Result('affected', sql, affected=cursor.rowcount)
 
     columns = [d[0] for d in cursor.description]
-    rows = cursor.fetchall()
+    try:
+        rows = cursor.fetchall()
+    except Exception as exc:
+        if interrupted(exc):
+            return Result('stopped', sql)
+        raise
     return Result(
         'rows',
         sql,
@@ -75,13 +109,19 @@ def split_statements(script):
     return stmts
 
 
-def run_script(dataset, statements, page_size=50):
-    # Allow running multiple statements from the query box.
+def run_script(dataset, statements, page_size=50, cancel_event=None):
+    # Allow running multiple statements from the query box. A cancellation
+    # lands on whatever statement is running, which is then marked stopped;
+    # the statements after it never run, just like on an error.
     results = []
     for stmt in statements:
-        result = run_one(dataset, stmt, page_size=page_size)
+        if cancel_event is not None and cancel_event.is_set():
+            results.append(Result('stopped', stmt))
+            break
+        result = run_one(dataset, stmt, page_size=page_size,
+                         cancel_event=cancel_event)
         results.append(result)
-        if result.kind == 'error':
+        if result.kind in ('error', 'stopped'):
             break
     return results
 

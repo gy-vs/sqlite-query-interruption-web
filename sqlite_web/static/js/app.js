@@ -464,7 +464,75 @@ App = window.App || {};
         });
     };
 
+    Recent = function() {};
+
+    /* Polls one server-side query execution and offers an explicit stop.
+       One Execution instance per running page; its execution id ties the
+       stop request and the polling to a single server-side submission. */
+    Execution = function() {};
+
+    Execution.prototype.initialize = function(options) {
+        this.statusUrl = options.statusUrl;
+        this.panel = $('.query-running');
+        if (!this.panel.length) return;
+        this.executionId = this.panel.data('execution-id');
+        this.stopButton = this.panel.find('#stop-execution');
+        this.stopping = false;
+        this.navigating = false;
+        this.interval = null;
+        this.bindHandlers();
+        this.poll();
+    };
+
+    Execution.prototype.bindHandlers = function() {
+        var self = this;
+        this.stopButton.on('click', function(e) {
+            e.preventDefault();
+            if (self.stopping) return;
+            self.stopping = true;
+            self.stopButton.prop('disabled', true).text('Stopping…');
+            $.post(self.statusUrl, function(data) {
+                if (data.status === 'finished') {
+                    self.finish(data);
+                }
+                /* 'stopping': keep polling until the worker reports done. */
+            });
+        });
+    };
+
+    Execution.prototype.poll = function() {
+        var self = this;
+        this.interval = setInterval(function() { self.check(); }, 500);
+    };
+
+    Execution.prototype.check = function() {
+        var self = this;
+        $.getJSON(this.statusUrl, function(data) {
+            if (data.status === 'finished') {
+                self.finish(data);
+            }
+        }).fail(function(xhr) {
+            /* A 404 means the outcome aged out or belongs to another
+               database/session: nothing left to wait on. */
+            if (xhr.status === 404) {
+                clearInterval(self.interval);
+                self.panel.remove();
+            }
+        });
+    };
+
+    Execution.prototype.finish = function(data) {
+        clearInterval(this.interval);
+        this.navigating = true;
+        if (data.url) {
+            window.location = data.url;
+        } else {
+            window.location.reload();
+        }
+    };
+
     exports.initialize = initialize;
     exports.Bookmarks = Bookmarks;
     exports.Recent = Recent;
+    exports.Execution = Execution;
 })(App, jQuery);

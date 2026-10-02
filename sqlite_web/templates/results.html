@@ -1,5 +1,9 @@
 {% if result.kind == 'error' %}
   <div class="alert alert-danger"><code>{{ result.error }}</code></div>
+{% elif result.kind == 'stopped' %}
+  {% if in_script %}
+    <div class="alert alert-secondary">Stopped by user.</div>
+  {% endif %}
 {% elif result.kind == 'affected' %}
   {% if result.affected >= 0 %}
     <p>Rows modified: <code>{{ result.affected }}</code></p>

@@ -5,7 +5,13 @@
     {% include "results.html" %}
   </div>
 {% endfor %}
-{% if total_statements > results|length %}
+{% if results and results[-1].kind == 'stopped' %}
+  <div class="alert alert-secondary">
+    Execution stopped by you after {{ results|length - 1 }} completed
+    statement(s); {{ total_statements - results|length }} remaining
+    statement(s) did not run.
+  </div>
+{% elif total_statements > results|length %}
   <div class="alert alert-warning">
     Execution stopped: {{ total_statements - results|length }} remaining
     statement(s) did not run.

@@ -11,5 +11,10 @@
       queryUrl: {{ url_for('generic_query')|tojson }},
       tableQueryUrl: {{ url_for('table_query', table='__TABLE__')|tojson }}
     });
+
+    var execution = new App.Execution();
+    execution.initialize({
+      statusUrl: {% if running and execution_id %}{{ url_for('query_execution', execution_id=execution_id)|tojson }}{% else %}''{% endif %}
+    });
   });
 </script>

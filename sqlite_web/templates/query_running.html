@@ -1,0 +1,19 @@
+{% if running and execution_id %}
+  <div class="alert alert-info d-flex align-items-center query-running"
+       data-execution-id="{{ execution_id }}">
+    <span class="spinner-border spinner-border-sm mr-2" role="status"
+          aria-hidden="true"></span>
+    <span class="mr-3">Running query&hellip;</span>
+    <button class="btn btn-sm btn-danger ml-auto" id="stop-execution"
+            type="button">Stop</button>
+  </div>
+  <noscript>
+    <meta http-equiv="refresh" content="2">
+  </noscript>
+{% endif %}
+{% if result and result.kind == 'stopped' %}
+  <div class="alert alert-secondary">
+    Execution stopped by you &mdash; the database stopped processing this
+    statement. Any earlier statements in the script remain applied.
+  </div>
+{% endif %}

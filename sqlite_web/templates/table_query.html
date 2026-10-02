@@ -22,9 +22,10 @@
   {% include "query_form.html" %}
   <hr />
 
+  {% include "query_running.html" %}
   {% if results %}
     {% include "results_multi.html" %}
-  {% elif result and result.kind != 'error' %}
+  {% elif result and result.kind not in ('error', 'stopped') %}
     {% set show_edit = allow_edit and result.keys %}
     {% set show_detail = allow_detail and result.keys %}
     {% set show_bulk = allow_bulk and result.keys %}

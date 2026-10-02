@@ -2,6 +2,8 @@ import os
 import shutil
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 
 from peewee import SqliteDatabase
@@ -156,6 +158,38 @@ class TestRunScript(BaseExecutorTestCase):
         self.assertTrue(results[0].has_next)
         self.assertEqual(results[1].rows[0][0], 3)
 
+    def test_cancel_before_start_does_not_run(self):
+        event = threading.Event()
+        event.set()
+        r = run_one(self.dataset, 'SELECT * FROM users', cancel_event=event)
+        self.assertEqual(r.kind, 'stopped')
+        self.assertEqual(r.statement, 'SELECT * FROM users')
+
+    def test_script_cancel_blocks_later_statements(self):
+        # Cancel arriving between statements keeps completed statements and
+        # marks the next one stopped; nothing after it runs.
+        event = threading.Event()
+        statements = split_statements(
+            "INSERT INTO users (username) VALUES ('a'); "
+            "INSERT INTO users (username) VALUES ('b');")
+
+        first = run_one(self.dataset, statements[0])
+        self.assertEqual(first.kind, 'affected')
+        event.set()
+        results = [first] + run_script(
+            self.dataset, statements[1:], cancel_event=event)
+        self.assertEqual([r.kind for r in results],
+                         ['affected', 'stopped'])
+        self.assertEqual(self.user_count(), 4)
+
+    def test_script_canceled_mid_statement_is_distinct_from_error(self):
+        results = run_script(
+            self.dataset,
+            split_statements('SELECT * FROM users; SELECT nocolumn FROM x;'),
+            cancel_event=threading.Event())
+        self.assertEqual(results[-1].kind, 'error')
+        self.assertNotEqual(results[-1].kind, 'stopped')
+
     def test_user_owned_transaction(self):
         results = self.run_sql(
             "BEGIN; INSERT INTO users (username) VALUES ('a'); COMMIT;")
@@ -251,6 +285,7 @@ class BaseAppTestCase(unittest.TestCase):
         self.db_path = os.path.join(self.tmp, 'app.db')
         conn = sqlite3.connect(self.db_path)
         conn.executescript(self.SCHEMA)
+        conn.executescript(NUMS_SQL)
         conn.execute('INSERT INTO blobs VALUES (?, ?)', (b'\x00\xff', 'blob'))
         conn.commit()
         conn.close()
@@ -298,6 +333,304 @@ class TestExecutionPolicy(BaseAppTestCase):
                                               'export_csv': '1'})
         self.assertIn(b'Only a single query may be exported', r.data)
         self.assertTrue(self.dbrows('SELECT COUNT(*) FROM users'))
+
+
+# A UDF-based slow query: wait_for() blocks until the test releases the gate,
+# and registers that the database really entered the statement. Registered
+# on every new connection via the startup hook, including worker threads.
+QUERY_GATE = threading.Event()
+QUERY_ENTERED = threading.Event()
+QUERY2_GATE = threading.Event()
+QUERY2_ENTERED = threading.Event()
+
+
+def _block_until_released(gate, entered):
+    # Model a long-running statement. interrupt() only wakes SQLite once the
+    # running statement regains control. The first call after release yields
+    # briefly so a pending interrupt is observed at the next VM step; later
+    # rows return immediately so the uninterrupted query finishes fast.
+    if gate.is_set():
+        return
+    entered.set()
+    if gate.wait(30):
+        time.sleep(0.05)
+
+
+def wait_for(step):
+    _block_until_released(QUERY_GATE, QUERY_ENTERED)
+    return step
+
+
+def wait_for_2(step):
+    _block_until_released(QUERY2_GATE, QUERY2_ENTERED)
+    return step
+
+
+def register_wait_udf(db):
+    conn = db.connection()
+    conn.create_function('wait_for', 1, wait_for)
+    conn.create_function('wait_for_2', 1, wait_for_2)
+
+
+# A numbers table seeded into every test database. A three-way cross join is
+# expensive enough to stay in-flight both inside the pager's wrapped subquery
+# and inside multi-statement scripts.
+NUMS_SQL = ('CREATE TABLE nums AS WITH RECURSIVE r(x) AS (SELECT 1 UNION ALL '
+            'SELECT x + 1 FROM r WHERE x < 300) SELECT x FROM r')
+
+
+SLOW_QUERY = ('SELECT wait_for(a.x + b.x) FROM nums a, nums b, nums c')
+SLOW_QUERY_2 = ('SELECT wait_for_2(a.x + b.x) FROM nums a, nums b, nums c')
+
+
+class QueryStopMixin:
+    def arm_slow_query(self):
+        QUERY_GATE.clear()
+        QUERY_ENTERED.clear()
+        QUERY2_GATE.clear()
+        QUERY2_ENTERED.clear()
+        # initialize_app() resets the hook to None, so (re)install it on the
+        # already-configured app for each slow-query test.
+        sw.dataset_config['startup_hook'] = register_wait_udf
+
+    def release_slow_query(self):
+        QUERY_GATE.set()
+        QUERY2_GATE.set()
+        time.sleep(0.1)
+
+    def wait_started(self):
+        self.assertTrue(QUERY_ENTERED.wait(5))
+
+    def wait_started_2(self):
+        self.assertTrue(QUERY2_ENTERED.wait(5))
+
+    def start_slow_query(self, url='/query/', sql=None):
+        response_future = {}
+
+        def submit():
+            response_future['response'] = self.client.post(url, data={
+                'sql': sql or SLOW_QUERY})
+
+        thread = threading.Thread(target=submit)
+        thread.start()
+        self.wait_started()
+        return thread, response_future
+
+    def execution_id_from_redirect(self, thread, response_future):
+        thread.join(5)
+        response = response_future['response']
+        self.assertIn(response.status_code, (302, 303))
+        location = response.headers['Location']
+        self.assertIn('execution=', location)
+        execution_id = location.split('execution=')[1].split('&')[0]
+        return execution_id, location
+
+    def status(self, execution_id):
+        return self.client.get('/query/execution/%s/' % execution_id)
+
+    def stop(self, execution_id):
+        # Post the stop first, then release the blocking UDF: SQLite only
+        # observes an interrupt flag once the statement yields back to the
+        # VM (a genuine join/scan checks it on every row).
+        response = self.client.post('/query/execution/%s/' % execution_id)
+        QUERY_GATE.set()
+        return response
+
+    def wait_finished(self, execution_id, timeout=10):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            data = self.status(execution_id).json
+            if data['status'] != 'running':
+                return data
+            time.sleep(0.02)
+        raise AssertionError('execution did not finish in time')
+
+
+class TestQueryStop(QueryStopMixin, BaseAppTestCase):
+    def tearDown(self):
+        self.release_slow_query()
+        super().tearDown()
+        sw.dataset_config['startup_hook'] = None
+
+    def test_slow_query_redirects_to_running_page(self):
+        self.arm_slow_query()
+        thread, future = self.start_slow_query()
+        execution_id, location = self.execution_id_from_redirect(
+            thread, future)
+        running = self.client.get(location)
+        self.assertEqual(running.status_code, 200)
+        self.assertIn(b'query-running', running.data)
+        self.assertIn(b'Stop', running.data)
+        self.assertIn(b'Running query', running.data)
+        # The SQL being executed stays editable in the textarea.
+        self.assertIn(b'wait_for', running.data)
+        self.assertEqual(self.status(execution_id).json['status'], 'running')
+
+    def test_stop_interrupts_database_and_marks_stopped(self):
+        self.arm_slow_query()
+        thread, future = self.start_slow_query()
+        execution_id, location = self.execution_id_from_redirect(
+            thread, future)
+
+        response = self.stop(execution_id)
+        self.assertEqual(response.json['status'], 'stopping')
+        status = self.wait_finished(execution_id)
+        thread.join(5)
+        # The worker's own connection received the interrupt, not a syntax
+        # failure and not an empty success.
+        self.assertEqual(status['status'], 'finished')
+        page = self.client.get(status['url'])
+        self.assertEqual(page.status_code, 200)
+        self.assertIn(b'Execution stopped by you', page.data)
+        self.assertNotIn(b'Empty result set', page.data)
+        self.assertNotIn(b'syntax error', page.data)
+
+    def test_stop_after_completion_shows_real_result(self):
+        self.arm_slow_query()
+        thread, future = self.start_slow_query()
+        execution_id, location = self.execution_id_from_redirect(
+            thread, future)
+        self.release_slow_query()
+        status = self.wait_finished(execution_id)
+        thread.join(5)
+        self.assertEqual(status['status'], 'finished')
+        # A late stop cannot rewrite a completed outcome.
+        response = self.stop(execution_id)
+        self.assertEqual(response.json['status'], 'finished')
+        page = self.client.get(status['url'])
+        self.assertIn(b'Results', page.data)
+        self.assertNotIn(b'Execution stopped by you', page.data)
+
+    def test_stop_is_scoped_to_one_execution(self):
+        self.arm_slow_query()
+        t1, f1 = self.start_slow_query()
+        e1, _ = self.execution_id_from_redirect(t1, f1)
+
+        QUERY2_GATE.clear()
+        QUERY2_ENTERED.clear()
+        future2 = {}
+
+        def submit2():
+            future2['response'] = self.client.post('/query/', data={
+                'sql': SLOW_QUERY_2})
+
+        t2 = threading.Thread(target=submit2)
+        t2.start()
+        self.wait_started_2()
+        e2, _ = self.execution_id_from_redirect(t2, future2)
+
+        self.assertEqual(self.stop(e1).json['status'], 'stopping')
+        status1 = self.wait_finished(e1)
+        t1.join(5)
+        self.assertEqual(status1['status'], 'finished')
+        # The other execution is untouched and still computing.
+        self.assertEqual(self.status(e2).json['status'], 'running')
+        page1 = self.client.get(status1['url'])
+        self.assertIn(b'Execution stopped by you', page1.data)
+        QUERY2_GATE.set()
+        status2 = self.wait_finished(e2)
+        t2.join(5)
+        page2 = self.client.get(status2['url'])
+        self.assertIn(b'Results', page2.data)
+
+    def test_unknown_execution_404s(self):
+        self.assertEqual(self.status('deadbeef' * 4).status_code, 404)
+        self.assertEqual(self.stop('deadbeef' * 4).status_code, 404)
+
+    def test_other_session_cannot_touch_execution(self):
+        self.arm_slow_query()
+        thread, future = self.start_slow_query()
+        execution_id, _ = self.execution_id_from_redirect(thread, future)
+        other = sw.app.test_client()
+        self.assertEqual(other.get(
+            '/query/execution/%s/' % execution_id).status_code, 404)
+        self.assertEqual(other.post(
+            '/query/execution/%s/' % execution_id).status_code, 404)
+
+    def test_script_stop_keeps_completed_statements(self):
+        self.arm_slow_query()
+        script = ("INSERT INTO users (username) VALUES ('done'); "
+                  "%s; "
+                  "INSERT INTO users (username) VALUES ('never');") % SLOW_QUERY
+        future = {}
+
+        def submit():
+            future['response'] = self.client.post('/query/',
+                                                  data={'sql': script})
+        thread = threading.Thread(target=submit)
+        thread.start()
+        self.wait_started()
+        thread.join(5)  # Post returns after the fast window.
+        location = future['response'].headers['Location']
+        execution_id = location.split('execution=')[1].split('&')[0]
+        self.stop(execution_id)
+        status = self.wait_finished(execution_id)
+        page = self.client.get(status['url'])
+        # The first INSERT applied; the slow SELECT is marked stopped; the
+        # trailing INSERT never ran.
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM users')[0][0], 4)
+        rows = self.dbrows("SELECT username FROM users WHERE username='never'")
+        self.assertEqual(rows, [])
+        self.assertIn(b'Rows modified', page.data)
+        self.assertIn(b'1 completed', page.data)
+        self.assertIn(b'1 remaining', page.data)
+        self.assertIn(b'Stopped by user', page.data)
+
+    def test_next_query_works_after_stop(self):
+        self.arm_slow_query()
+        thread, future = self.start_slow_query()
+        execution_id, _ = self.execution_id_from_redirect(thread, future)
+        self.stop(execution_id)
+        self.wait_finished(execution_id)
+        thread.join(5)
+        # The stop leaves no long-lived state blocking the next submission.
+        response = self.client.post('/query/', data={'sql': 'SELECT 1'})
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b'1', response.data)
+
+
+class TestCrossDbExecutionScoping(QueryStopMixin, BaseAppTestCase):
+    def setUp(self):
+        super().setUp()
+        self.db2 = os.path.join(self.tmp, 'two.db')
+        conn = sqlite3.connect(self.db2)
+        conn.execute('CREATE TABLE t2 (id INTEGER PRIMARY KEY)')
+        conn.commit()
+        conn.close()
+        sw.datasets.clear()
+        sw.initialize_app([self.db_path, self.db2])
+        self.client = sw.app.test_client()
+
+    def tearDown(self):
+        self.release_slow_query()
+        super().tearDown()
+        sw.dataset_config['startup_hook'] = None
+
+    def test_execution_is_tied_to_started_database(self):
+        self.arm_slow_query()
+        thread, future = self.start_slow_query()
+        execution_id, _ = self.execution_id_from_redirect(thread, future)
+        # Switching this session to the other database hides the execution.
+        with self.client.session_transaction() as sess:
+            sess['dataset'] = os.path.realpath(self.db2)
+        self.assertEqual(self.status(execution_id).status_code, 404)
+        with self.client.session_transaction() as sess:
+            sess['dataset'] = os.path.realpath(self.db_path)
+
+
+class TestFastExecutionPath(BaseAppTestCase):
+    def test_fast_select_post_renders_inline(self):
+        response = self.client.post('/query/',
+                                    data={'sql': 'SELECT * FROM users'})
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b'huey', response.data)
+        self.assertNotIn(b'query-running', response.data)
+
+    def test_sql_error_is_not_rendered_as_stopped(self):
+        response = self.client.post('/query/', data={'sql': 'SELECT bad'})
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b'is-invalid', response.data)
+        self.assertNotIn(b'Execution stopped by you', response.data)
 
 
 class TestValueFilter(unittest.TestCase):
